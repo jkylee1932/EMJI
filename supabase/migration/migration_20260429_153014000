@@ -1,0 +1,186 @@
+
+-- Profiles table (extends auth.users)
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'student' CHECK (role IN ('student', 'educator')),
+  bio TEXT DEFAULT '',
+  avatar_url TEXT DEFAULT '',
+  professional_title TEXT DEFAULT '',
+  is_premium BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public profiles are viewable by everyone" ON profiles FOR SELECT USING (true);
+CREATE POLICY "Users can update own profile" ON profiles FOR UPDATE USING (auth.uid() = id);
+
+-- Trigger to create profile on user signup
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = ''
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name, role)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', ''),
+    COALESCE(NEW.raw_user_meta_data->>'role', 'student')
+  );
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+
+-- Courses table
+CREATE TABLE courses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  level TEXT NOT NULL DEFAULT 'Beginner' CHECK (level IN ('Beginner', 'Intermediate', 'Advanced')),
+  price_type TEXT NOT NULL DEFAULT 'free' CHECK (price_type IN ('free', 'premium')),
+  instructor_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+  thumbnail_color TEXT DEFAULT 'gradient-hero',
+  rating NUMERIC(3,1) DEFAULT 0,
+  students_count INTEGER DEFAULT 0,
+  duration TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE courses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Published courses are viewable by everyone" ON courses FOR SELECT USING (status = 'published' OR instructor_id = auth.uid());
+CREATE POLICY "Educators can insert courses" ON courses FOR INSERT WITH CHECK (auth.uid() = instructor_id);
+CREATE POLICY "Educators can update own courses" ON courses FOR UPDATE USING (auth.uid() = instructor_id);
+CREATE POLICY "Educators can delete own courses" ON courses FOR DELETE USING (auth.uid() = instructor_id);
+
+-- Modules table
+CREATE TABLE modules (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  "order" INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE modules ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Modules are viewable by everyone" ON modules FOR SELECT USING (true);
+CREATE POLICY "Educators can manage modules for own courses" ON modules FOR ALL USING (
+  EXISTS (SELECT 1 FROM courses WHERE courses.id = modules.course_id AND courses.instructor_id = auth.uid())
+);
+
+-- Lessons table
+CREATE TABLE lessons (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  module_id UUID NOT NULL REFERENCES modules(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'video' CHECK (type IN ('video', 'quiz', 'note')),
+  duration TEXT DEFAULT '',
+  is_free BOOLEAN DEFAULT FALSE,
+  "order" INTEGER NOT NULL DEFAULT 0,
+  content TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE lessons ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Lessons are viewable by everyone" ON lessons FOR SELECT USING (true);
+CREATE POLICY "Educators can manage lessons for own modules" ON lessons FOR ALL USING (
+  EXISTS (
+    SELECT 1 FROM modules m
+    JOIN courses c ON c.id = m.course_id
+    WHERE m.id = lessons.module_id AND c.instructor_id = auth.uid()
+  )
+);
+
+-- Enrollments table
+CREATE TABLE enrollments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  enrolled_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, course_id)
+);
+
+ALTER TABLE enrollments ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own enrollments" ON enrollments FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Educators can view enrollments for own courses" ON enrollments FOR SELECT USING (
+  EXISTS (SELECT 1 FROM courses WHERE courses.id = enrollments.course_id AND courses.instructor_id = auth.uid())
+);
+CREATE POLICY "Users can enroll in courses" ON enrollments FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can unenroll" ON enrollments FOR DELETE USING (auth.uid() = user_id);
+
+-- Lesson progress table
+CREATE TABLE lesson_progress (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  lesson_id UUID NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+  completed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, lesson_id)
+);
+
+ALTER TABLE lesson_progress ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own progress" ON lesson_progress FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can update own progress" ON lesson_progress FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can delete own progress" ON lesson_progress FOR DELETE USING (auth.uid() = user_id);
+
+-- Bookmarks table
+CREATE TABLE bookmarks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, course_id)
+);
+
+ALTER TABLE bookmarks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own bookmarks" ON bookmarks FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage own bookmarks" ON bookmarks FOR ALL USING (auth.uid() = user_id);
+
+-- Reviews table
+CREATE TABLE reviews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  comment TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, course_id)
+);
+
+ALTER TABLE reviews ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Reviews are public" ON reviews FOR SELECT USING (true);
+CREATE POLICY "Users can create reviews" ON reviews FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own reviews" ON reviews FOR UPDATE USING (auth.uid() = user_id);
+
+-- Certificates table
+CREATE TABLE certificates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  issued_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(user_id, course_id)
+);
+
+ALTER TABLE certificates ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own certificates" ON certificates FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "System can issue certificates" ON certificates FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+-- Enable realtime for key tables
+ALTER PUBLICATION supabase_realtime ADD TABLE enrollments;
+ALTER PUBLICATION supabase_realtime ADD TABLE lesson_progress;
